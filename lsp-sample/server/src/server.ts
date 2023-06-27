@@ -14,12 +14,12 @@ import {
 	CompletionItemKind,
 	TextDocumentPositionParams,
 	TextDocumentSyncKind,
-	InitializeResult
+	InitializeResult,
 } from 'vscode-languageserver/node';
+import { URI } from 'vscode-uri';
 
-import {
-	TextDocument
-} from 'vscode-languageserver-textdocument';
+import { TextDocument } from 'vscode-languageserver-textdocument';
+import { Project, SyntaxKind } from 'ts-morph';
 
 // Create a connection for the server, using Node's IPC as a transport.
 // Also include all preview / proposed LSP features.
@@ -54,15 +54,15 @@ connection.onInitialize((params: InitializeParams) => {
 			textDocumentSync: TextDocumentSyncKind.Incremental,
 			// Tell the client that this server supports code completion.
 			completionProvider: {
-				resolveProvider: true
-			}
-		}
+				resolveProvider: true,
+			},
+		},
 	};
 	if (hasWorkspaceFolderCapability) {
 		result.capabilities.workspace = {
 			workspaceFolders: {
-				supported: true
-			}
+				supported: true,
+			},
 		};
 	}
 	return result;
@@ -74,7 +74,7 @@ connection.onInitialized(() => {
 		connection.client.register(DidChangeConfigurationNotification.type, undefined);
 	}
 	if (hasWorkspaceFolderCapability) {
-		connection.workspace.onDidChangeWorkspaceFolders(_event => {
+		connection.workspace.onDidChangeWorkspaceFolders((_event) => {
 			connection.console.log('Workspace folder change event received.');
 		});
 	}
@@ -94,7 +94,7 @@ let globalSettings: ExampleSettings = defaultSettings;
 // Cache the settings of all open documents
 const documentSettings: Map<string, Thenable<ExampleSettings>> = new Map();
 
-connection.onDidChangeConfiguration(change => {
+connection.onDidChangeConfiguration((change) => {
 	if (hasConfigurationCapability) {
 		// Reset all cached document settings
 		documentSettings.clear();
@@ -105,7 +105,7 @@ connection.onDidChangeConfiguration(change => {
 	}
 
 	// Revalidate all open text documents
-	documents.all().forEach(validateTextDocument);
+	// documents.all().forEach(validateTextDocument);
 });
 
 function getDocumentSettings(resource: string): Thenable<ExampleSettings> {
@@ -116,7 +116,7 @@ function getDocumentSettings(resource: string): Thenable<ExampleSettings> {
 	if (!result) {
 		result = connection.workspace.getConfiguration({
 			scopeUri: resource,
-			section: 'languageServerExample'
+			section: 'languageServerExample',
 		});
 		documentSettings.set(resource, result);
 	}
@@ -124,64 +124,60 @@ function getDocumentSettings(resource: string): Thenable<ExampleSettings> {
 }
 
 // Only keep settings for open documents
-documents.onDidClose(e => {
+documents.onDidClose((e) => {
 	documentSettings.delete(e.document.uri);
 });
 
 // The content of a text document has changed. This event is emitted
 // when the text document first opened or when its content has changed.
-documents.onDidChangeContent(change => {
-	validateTextDocument(change.document);
+documents.onDidChangeContent(async (change) => {
+	const document = change.document;
+	const uri = document.uri;
+	const filePath = URI.parse(uri).fsPath;
+	const fileContent = document.getText();
+
+	const project = new Project();
+	const sourceFile = project.createSourceFile(filePath, fileContent);
+
+	const diagnostics: Diagnostic[] = [];
+
+	sourceFile.forEachDescendant((node) => {
+		if (node.getKindName() === 'CallExpression') {
+			const callExpression = node.asKind(SyntaxKind.CallExpression);
+			const expression = callExpression?.getExpression();
+			const name = expression?.getText();
+
+			if (callExpression && name?.endsWith('.pipe')) {
+				const argumentsArray = callExpression?.getArguments();
+				const hasTakeUntilOrTakeWhile = argumentsArray?.some((arg) => {
+					return (
+						arg.getText().includes('takeUntil') ||
+						arg.getText().includes('takeWhile')
+					);
+				});
+
+				if (!hasTakeUntilOrTakeWhile) {
+					const diagnostic: Diagnostic = {
+						severity: DiagnosticSeverity.Warning,
+						range: {
+							start: document.positionAt(callExpression.getStart()),
+							end: document.positionAt(callExpression.getEnd()),
+						},
+						message:
+							'RxJS Observable pipe without takeUntil/takeWhile may cause memory leaks.',
+						source: 'rxjs-memory-leak-detection',
+					};
+
+					diagnostics.push(diagnostic);
+				}
+			}
+		}
+	});
+
+	connection.sendDiagnostics({ uri, diagnostics });
 });
 
-async function validateTextDocument(textDocument: TextDocument): Promise<void> {
-	// In this simple example we get the settings for every validate run.
-	const settings = await getDocumentSettings(textDocument.uri);
-
-	// The validator creates diagnostics for all uppercase words length 2 and more
-	const text = textDocument.getText();
-	const pattern = /\b[A-Z]{2,}\b/g;
-	let m: RegExpExecArray | null;
-
-	let problems = 0;
-	const diagnostics: Diagnostic[] = [];
-	while ((m = pattern.exec(text)) && problems < settings.maxNumberOfProblems) {
-		problems++;
-		const diagnostic: Diagnostic = {
-			severity: DiagnosticSeverity.Warning,
-			range: {
-				start: textDocument.positionAt(m.index),
-				end: textDocument.positionAt(m.index + m[0].length)
-			},
-			message: `${m[0]} is all uppercase.`,
-			source: 'ex'
-		};
-		if (hasDiagnosticRelatedInformationCapability) {
-			diagnostic.relatedInformation = [
-				{
-					location: {
-						uri: textDocument.uri,
-						range: Object.assign({}, diagnostic.range)
-					},
-					message: 'Spelling matters'
-				},
-				{
-					location: {
-						uri: textDocument.uri,
-						range: Object.assign({}, diagnostic.range)
-					},
-					message: 'Particularly for names'
-				}
-			];
-		}
-		diagnostics.push(diagnostic);
-	}
-
-	// Send the computed diagnostics to VSCode.
-	connection.sendDiagnostics({ uri: textDocument.uri, diagnostics });
-}
-
-connection.onDidChangeWatchedFiles(_change => {
+connection.onDidChangeWatchedFiles((_change) => {
 	// Monitored files have change in VSCode
 	connection.console.log('We received an file change event');
 });
@@ -196,31 +192,29 @@ connection.onCompletion(
 			{
 				label: 'TypeScript',
 				kind: CompletionItemKind.Text,
-				data: 1
+				data: 1,
 			},
 			{
 				label: 'JavaScript',
 				kind: CompletionItemKind.Text,
-				data: 2
-			}
+				data: 2,
+			},
 		];
 	}
 );
 
 // This handler resolves additional information for the item selected in
 // the completion list.
-connection.onCompletionResolve(
-	(item: CompletionItem): CompletionItem => {
-		if (item.data === 1) {
-			item.detail = 'TypeScript details';
-			item.documentation = 'TypeScript documentation';
-		} else if (item.data === 2) {
-			item.detail = 'JavaScript details';
-			item.documentation = 'JavaScript documentation';
-		}
-		return item;
+connection.onCompletionResolve((item: CompletionItem): CompletionItem => {
+	if (item.data === 1) {
+		item.detail = 'TypeScript details';
+		item.documentation = 'TypeScript documentation';
+	} else if (item.data === 2) {
+		item.detail = 'JavaScript details';
+		item.documentation = 'JavaScript documentation';
 	}
-);
+	return item;
+});
 
 // Make the text document manager listen on the connection
 // for open, change and close text document events
